@@ -1,0 +1,144 @@
+name: Build and complete CritSheet release
+
+on:
+  workflow_dispatch:
+    inputs:
+      from_tag:
+        description: Release tag that already has the verified book packs
+        required: true
+      to_tag:
+        description: Draft release tag to build and complete
+        required: true
+      source_ref:
+        description: CritSheet source branch, tag, or commit
+        required: true
+        default: main
+
+permissions:
+  contents: write
+
+jobs:
+  build-app:
+    runs-on: windows-latest
+    steps:
+      - name: Check out CritSheet source
+        uses: actions/checkout@v4
+        with:
+          repository: CritnCoin/Critsheet
+          ref: ${{ inputs.source_ref }}
+          path: source
+
+      - name: Configure the Windows build
+        shell: powershell
+        run: cmake -S source -B source/build -A x64
+
+      - name: Build and package CritSheet
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File source/tools/make_release.ps1
+
+      - name: Upload and verify the app and launcher
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TO_TAG: ${{ inputs.to_tag }}
+        run: |
+          $version = (Get-Content source/VERSION -Raw).Trim()
+          if ("v$version" -ne $env:TO_TAG) { throw "VERSION $version does not match $env:TO_TAG" }
+          $files = @(
+            "source/dist/CritSheet-$version.zip",
+            "source/dist/CritSheetLauncher.exe"
+          )
+          foreach ($file in $files) {
+            gh release upload $env:TO_TAG $file --repo $env:REPOSITORY --clobber
+            if ($LASTEXITCODE -ne 0) { throw "Could not upload $file" }
+            $name = Split-Path $file -Leaf
+            $localHash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
+            $asset = gh release view $env:TO_TAG --repo $env:REPOSITORY --json assets |
+              ConvertFrom-Json | Select-Object -ExpandProperty assets |
+              Where-Object name -eq $name | Select-Object -First 1
+            $remoteHash = if ($asset.digest -like 'sha256:*') { $asset.digest.Substring(7).ToLowerInvariant() } else { '' }
+            if (-not $asset -or [long]$asset.size -ne (Get-Item $file).Length -or $remoteHash -ne $localHash) {
+              throw "GitHub verification failed for $name"
+            }
+          }
+
+  copy-books:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Copy CritSheet book and image packs inside GitHub
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          FROM_TAG: ${{ inputs.from_tag }}
+          TO_TAG: ${{ inputs.to_tag }}
+        run: |
+          set -euo pipefail
+          work="${RUNNER_TEMP}/critsheet-assets"
+          mkdir -p "$work"
+
+          mapfile -t assets < <(
+            gh release view "$FROM_TAG" --repo "$REPOSITORY" --json assets \
+              --jq '[.assets[].name | select(startswith("CritSheet-Books-"))] | reverse | .[]'
+          )
+          if [[ ${#assets[@]} -eq 0 ]]; then
+            echo "No CritSheet book assets found on $FROM_TAG" >&2
+            exit 1
+          fi
+
+          for name in "${assets[@]}"; do
+            if gh release view "$TO_TAG" --repo "$REPOSITORY" --json assets \
+              --jq '.assets[] | select(.name == "'"$name"'" and .state == "uploaded") | .name' | grep -Fxq "$name"; then
+              echo "Already present: $name"
+              continue
+            fi
+
+            echo "Copying $name from $FROM_TAG to $TO_TAG"
+            gh release download "$FROM_TAG" --repo "$REPOSITORY" --pattern "$name" --dir "$work"
+            gh release upload "$TO_TAG" "$work/$name" --repo "$REPOSITORY" --clobber
+            rm -f "$work/$name"
+          done
+
+  verify-and-publish:
+    needs: [build-app, copy-books]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify every asset and publish the draft
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          FROM_TAG: ${{ inputs.from_tag }}
+          TO_TAG: ${{ inputs.to_tag }}
+        run: |
+          set -euo pipefail
+          version="${TO_TAG#v}"
+          mapfile -t book_assets < <(
+            gh release view "$FROM_TAG" --repo "$REPOSITORY" --json assets \
+              --jq '.assets[] | select(.name | startswith("CritSheet-Books-")) | [.name, (.size|tostring), .digest] | @tsv'
+          )
+          for source in "${book_assets[@]}"; do
+            IFS=$'\t' read -r name size digest <<< "$source"
+            target=$(gh release view "$TO_TAG" --repo "$REPOSITORY" --json assets \
+              --jq '.assets[] | select(.name == "'"$name"'") | [(.size|tostring), .digest, .state] | @tsv')
+            IFS=$'\t' read -r target_size target_digest target_state <<< "$target"
+            [[ "$target_size" == "$size" && "$target_digest" == "$digest" && "$target_state" == "uploaded" ]] || {
+              echo "Verification failed for $name" >&2
+              exit 1
+            }
+          done
+
+          for name in "CritSheet-$version.zip" CritSheetLauncher.exe; do
+            state=$(gh release view "$TO_TAG" --repo "$REPOSITORY" --json assets \
+              --jq '.assets[] | select(.name == "'"$name"'") | .state')
+            [[ "$state" == "uploaded" ]] || { echo "Missing verified asset: $name" >&2; exit 1; }
+          done
+
+          count=$(gh release view "$TO_TAG" --repo "$REPOSITORY" --json assets --jq '.assets | length')
+          expected=$((${#book_assets[@]} + 2))
+          [[ "$count" -eq "$expected" ]] || {
+            echo "Expected $expected release assets, found $count" >&2
+            exit 1
+          }
+          gh release edit "$TO_TAG" --repo "$REPOSITORY" --draft=false --latest
