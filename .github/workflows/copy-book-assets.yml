@@ -27,6 +27,7 @@ jobs:
           repository: CritnCoin/Critsheet
           ref: ${{ inputs.source_ref }}
           path: source
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
 
       - name: Configure the Windows build
         shell: powershell
