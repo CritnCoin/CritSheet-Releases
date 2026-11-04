@@ -1,0 +1,91 @@
+name: Assemble and publish CritSheet release
+
+on:
+  workflow_dispatch:
+    inputs:
+      from_tag:
+        description: Release tag containing the verified book packs
+        required: true
+      to_tag:
+        description: Draft release tag to complete
+        required: true
+      app_name:
+        description: Final application ZIP name
+        required: true
+      expected_sha256:
+        description: SHA-256 of the original application ZIP
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  assemble-verify-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Assemble the app, verify every asset, and publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          FROM_TAG: ${{ inputs.from_tag }}
+          TO_TAG: ${{ inputs.to_tag }}
+          APP_NAME: ${{ inputs.app_name }}
+          EXPECTED_SHA256: ${{ inputs.expected_sha256 }}
+        run: |
+          set -euo pipefail
+          work="${RUNNER_TEMP}/critsheet-app"
+          mkdir -p "$work/parts"
+          gh release download "$TO_TAG" --repo "$REPOSITORY" \
+            --pattern "$APP_NAME.part-*" --dir "$work/parts"
+
+          mapfile -t parts < <(find "$work/parts" -maxdepth 1 -type f -name "$APP_NAME.part-*" | sort -V)
+          [[ ${#parts[@]} -gt 0 ]] || { echo "No app parts found" >&2; exit 1; }
+          for part in "${parts[@]}"; do cat "$part" >> "$work/$APP_NAME"; done
+
+          actual=$(sha256sum "$work/$APP_NAME" | awk '{print $1}')
+          expected=$(printf '%s' "$EXPECTED_SHA256" | tr '[:upper:]' '[:lower:]')
+          [[ "$actual" == "$expected" ]] || {
+            echo "Reassembled app hash mismatch: expected $expected, got $actual" >&2
+            exit 1
+          }
+
+          gh release upload "$TO_TAG" "$work/$APP_NAME" --repo "$REPOSITORY" --clobber
+          remote=$(gh release view "$TO_TAG" --repo "$REPOSITORY" --json assets \
+            --jq '.assets[] | select(.name == "'"$APP_NAME"'") | [.digest, .state] | @tsv')
+          IFS=$'\t' read -r app_digest app_state <<< "$remote"
+          [[ "$app_digest" == "sha256:$actual" && "$app_state" == "uploaded" ]] || {
+            echo "GitHub did not verify the final app ZIP" >&2
+            exit 1
+          }
+
+          mapfile -t book_assets < <(
+            gh release view "$FROM_TAG" --repo "$REPOSITORY" --json assets \
+              --jq '.assets[] | select(.name | startswith("CritSheet-Books-")) | [.name, (.size|tostring), .digest] | @tsv'
+          )
+          for source in "${book_assets[@]}"; do
+            IFS=$'\t' read -r name size digest <<< "$source"
+            target=$(gh release view "$TO_TAG" --repo "$REPOSITORY" --json assets \
+              --jq '.assets[] | select(.name == "'"$name"'") | [(.size|tostring), .digest, .state] | @tsv')
+            IFS=$'\t' read -r target_size target_digest target_state <<< "$target"
+            [[ "$target_size" == "$size" && "$target_digest" == "$digest" && "$target_state" == "uploaded" ]] || {
+              echo "Verification failed for $name" >&2
+              exit 1
+            }
+          done
+
+          launcher_state=$(gh release view "$TO_TAG" --repo "$REPOSITORY" --json assets \
+            --jq '.assets[] | select(.name == "CritSheetLauncher.exe") | .state')
+          [[ "$launcher_state" == "uploaded" ]] || { echo "Launcher is missing" >&2; exit 1; }
+
+          for part in "${parts[@]}"; do
+            gh release delete-asset "$TO_TAG" "$(basename "$part")" --repo "$REPOSITORY" --yes
+          done
+
+          count=$(gh release view "$TO_TAG" --repo "$REPOSITORY" --json assets --jq '.assets | length')
+          expected_count=$((${#book_assets[@]} + 2))
+          [[ "$count" -eq "$expected_count" ]] || {
+            echo "Expected $expected_count final assets, found $count" >&2
+            exit 1
+          }
+          gh release edit "$TO_TAG" --repo "$REPOSITORY" --draft=false --latest
