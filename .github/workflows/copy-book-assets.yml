@@ -28,7 +28,8 @@ jobs:
           SOURCE_REF: ${{ inputs.source_ref }}
         run: |
           $keyPath = Join-Path $env:RUNNER_TEMP 'critsheet_source_key'
-          [System.IO.File]::WriteAllText($keyPath, $env:SOURCE_DEPLOY_KEY)
+          $keyText = ($env:SOURCE_DEPLOY_KEY -replace "`r`n", "`n").TrimEnd() + "`n"
+          [System.IO.File]::WriteAllText($keyPath, $keyText, [System.Text.UTF8Encoding]::new($false))
           icacls $keyPath /inheritance:r /grant:r "$($env:USERNAME):(R)" | Out-Null
           $env:GIT_SSH_COMMAND = "ssh -i `"$keyPath`" -o StrictHostKeyChecking=accept-new"
           git clone --depth 1 --filter=blob:none --sparse --branch $env:SOURCE_REF git@github.com:CritnCoin/Critsheet.git source
