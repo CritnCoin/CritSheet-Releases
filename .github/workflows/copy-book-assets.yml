@@ -21,25 +21,21 @@ jobs:
   build-app:
     runs-on: windows-latest
     steps:
-      - name: Check out CritSheet source
-        uses: actions/checkout@v4
-        with:
-          repository: CritnCoin/Critsheet
-          ref: ${{ inputs.source_ref }}
-          path: source
-          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
-          sparse-checkout: |
-            CMakeLists.txt
-            VERSION
-            source
-            header
-            launcher
-            rust
-            external
-            resources
-            data
-            tools
-          sparse-checkout-cone-mode: true
+      - name: Check out only release build inputs
+        shell: powershell
+        env:
+          SOURCE_DEPLOY_KEY: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          $keyPath = Join-Path $env:RUNNER_TEMP 'critsheet_source_key'
+          [System.IO.File]::WriteAllText($keyPath, $env:SOURCE_DEPLOY_KEY)
+          icacls $keyPath /inheritance:r /grant:r "$($env:USERNAME):(R)" | Out-Null
+          $env:GIT_SSH_COMMAND = "ssh -i `"$keyPath`" -o StrictHostKeyChecking=accept-new"
+          git clone --depth 1 --filter=blob:none --sparse --branch $env:SOURCE_REF git@github.com:CritnCoin/Critsheet.git source
+          if ($LASTEXITCODE -ne 0) { throw 'Could not clone the CritSheet source.' }
+          git -C source sparse-checkout set source header launcher rust external resources data tools
+          if ($LASTEXITCODE -ne 0) { throw 'Could not select the release build inputs.' }
+          Remove-Item -LiteralPath $keyPath -Force
 
       - name: Configure the Windows build
         shell: powershell
