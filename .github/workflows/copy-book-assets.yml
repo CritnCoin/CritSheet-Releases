@@ -28,6 +28,18 @@ jobs:
           ref: ${{ inputs.source_ref }}
           path: source
           ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          sparse-checkout: |
+            CMakeLists.txt
+            VERSION
+            source
+            header
+            launcher
+            rust
+            external
+            resources
+            data
+            tools
+          sparse-checkout-cone-mode: true
 
       - name: Configure the Windows build
         shell: powershell
